@@ -34,8 +34,11 @@ const navItems = [
   { label: 'Home', to: '/' },
   { label: 'About', to: '/about' },
   { label: 'Notice', to: '/notice' },
+  { label: 'Complain', to: '/complain' },
   { label: 'Contact', to: '/contact' },
 ]
+
+const noticeCategories = ['All', 'Academic', 'Administrative', 'Events', 'Results']
 
 const schoolInfo = {
   name: 'Darbar Secondary School',
@@ -72,6 +75,15 @@ const defaultNotices = [
     date: '2026-09-26',
     summary:
       'Students can register for athletics and indoor events as part of the school sports week. Participation from every grade is encouraged.',
+    image: '',
+  },
+  {
+    id: 4,
+    title: 'Final Examination Results Published',
+    category: 'Results',
+    date: '2026-09-18',
+    summary:
+      'The school has published the final examination results for all classes. Students and parents may collect the original marksheets from the office.',
     image: '',
   },
 ]
@@ -111,6 +123,9 @@ function App() {
   const [noticesLoading, setNoticesLoading] = useState(Boolean(supabase))
   const [noticeStorageError, setNoticeStorageError] = useState('')
   const [noticeLoadError, setNoticeLoadError] = useState('')
+  const [complaints, setComplaints] = useState([])
+  const [complaintsLoading, setComplaintsLoading] = useState(false)
+  const [complaintError, setComplaintError] = useState('')
   const [isAdmin, setIsAdmin] = useState(false)
   const [loginOpen, setLoginOpen] = useState(false)
 
@@ -153,12 +168,74 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!isAdmin || !supabase) return undefined
+
+    let active = true
+    const loadComplaints = async () => {
+      setComplaintsLoading(true)
+      setComplaintError('')
+      const { data, error } = await supabase
+        .from('complaints')
+        .select('id, name, contact, category, message, image_paths, status, created_at')
+        .order('created_at', { ascending: false })
+
+      if (error) {
+        if (active) {
+          setComplaints([])
+          setComplaintError(`Complaints could not be loaded: ${error.message}`)
+          setComplaintsLoading(false)
+        }
+        return
+      }
+
+      try {
+        const loadedComplaints = await Promise.all(data.map(async (row) => {
+          const images = await Promise.all((row.image_paths || []).map(async (path) => {
+            const { data: signedImage, error: imageError } = await supabase.storage
+              .from('complaint-images')
+              .createSignedUrl(path, 3600)
+            if (imageError) throw new Error(`An attached image could not be loaded: ${imageError.message}`)
+            return { path, url: signedImage.signedUrl }
+          }))
+
+          return {
+            id: row.id,
+            name: row.name,
+            contact: row.contact,
+            type: row.category,
+            message: row.message,
+            images,
+            status: row.status,
+            createdAt: row.created_at,
+          }
+        }))
+
+        if (active) setComplaints(loadedComplaints)
+      } catch (error) {
+        if (active) {
+          const message = error instanceof Error ? error.message : String(error)
+          setComplaintError(`Complaint images could not be loaded: ${message}`)
+        }
+      } finally {
+        if (active) setComplaintsLoading(false)
+      }
+    }
+
+    loadComplaints()
+    return () => { active = false }
+  }, [isAdmin])
+
+  useEffect(() => {
     if (!supabase) return undefined
 
     let active = true
     const syncAdmin = async (session) => {
       if (!session?.user) {
-        if (active) setIsAdmin(false)
+        if (active) {
+          setIsAdmin(false)
+          setComplaints([])
+          setComplaintsLoading(false)
+        }
         return
       }
 
@@ -172,6 +249,7 @@ function App() {
       if (error) {
         setNoticeStorageError(`Admin access could not be verified: ${error.message}`)
         setIsAdmin(false)
+        setComplaints([])
         return
       }
       setIsAdmin(Boolean(data))
@@ -233,6 +311,8 @@ function App() {
       return
     }
     setIsAdmin(false)
+    setComplaints([])
+    setComplaintsLoading(false)
     setNoticeStorageError('')
   }
 
@@ -315,6 +395,104 @@ function App() {
     }
   }
 
+  const handleAddComplaint = async (complaint) => {
+    if (!supabase) {
+      return { error: 'Complaint submission is not configured. Please contact the school office directly.' }
+    }
+
+    const id = crypto.randomUUID()
+    const uploadedPaths = []
+    const extensionByType = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }
+
+    for (const file of complaint.attachments) {
+      const extension = extensionByType[file.type]
+      if (!extension || file.size > 1024 * 1024) {
+        return { error: 'Each attachment must be a JPG, PNG, or WebP image no larger than 1 MB.' }
+      }
+    }
+
+    try {
+      for (const file of complaint.attachments) {
+        const path = `${id}/${crypto.randomUUID()}.${extensionByType[file.type]}`
+        const { error: uploadError } = await supabase.storage
+          .from('complaint-images')
+          .upload(path, file, { contentType: file.type, upsert: false })
+
+        if (uploadError) throw new Error(`An image could not be uploaded: ${uploadError.message}`)
+        uploadedPaths.push(path)
+      }
+
+      const { error } = await supabase.from('complaints').insert({
+        id,
+        name: complaint.name.trim(),
+        contact: complaint.contact.trim(),
+        category: complaint.type,
+        message: complaint.message.trim(),
+        image_paths: uploadedPaths,
+      })
+
+      if (error) {
+        const message = error.code === 'PGRST205'
+          ? 'The complaint service is not configured yet. Please contact the school office.'
+          : `Your complaint could not be submitted: ${error.message}`
+        throw new Error(message)
+      }
+      return { success: true }
+    } catch (error) {
+      if (uploadedPaths.length > 0) {
+        const { error: cleanupError } = await supabase.storage.from('complaint-images').remove(uploadedPaths)
+        if (cleanupError) {
+          const message = error instanceof Error ? error.message : String(error)
+          return { error: `${message}. Uploaded images could not be cleaned up: ${cleanupError.message}` }
+        }
+      }
+
+      return { error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  const handleComplaintStatus = async (complaintId, nextStatus) => {
+    setComplaintError('')
+    const { error } = await supabase
+      .from('complaints')
+      .update({ status: nextStatus })
+      .eq('id', complaintId)
+      .select('id')
+      .single()
+
+    if (error) {
+      setComplaintError(`Complaint status could not be updated: ${error.message}`)
+      return false
+    }
+
+    setComplaints((current) => current.map((item) => (
+      item.id === complaintId ? { ...item, status: nextStatus } : item
+    )))
+    return true
+  }
+
+  const handleDeleteComplaint = async (complaintId) => {
+    setComplaintError('')
+    const complaint = complaints.find((item) => item.id === complaintId)
+    const { error } = await supabase.from('complaints').delete().eq('id', complaintId)
+    if (error) {
+      setComplaintError(`Complaint could not be deleted: ${error.message}`)
+      return false
+    }
+
+    setComplaints((current) => current.filter((item) => item.id !== complaintId))
+    if (complaint?.images.length) {
+      const { error: imageError } = await supabase.storage
+        .from('complaint-images')
+        .remove(complaint.images.map((image) => image.path))
+      if (imageError) {
+        setComplaintError(`The complaint was deleted, but its images could not be removed: ${imageError.message}`)
+        return false
+      }
+    }
+    return true
+  }
+
   return (
     <BrowserRouter>
       <Layout
@@ -341,6 +519,21 @@ function App() {
               />
             }
           />
+          <Route path="/complain" element={<ComplainPage onSubmitComplaint={handleAddComplaint} />} />
+          <Route
+            path="/admin/complaints"
+            element={
+              <AdminComplaintsPage
+                isAdmin={isAdmin}
+                complaints={complaints}
+                isLoading={complaintsLoading}
+                error={complaintError}
+                onStatusChange={handleComplaintStatus}
+                onDelete={handleDeleteComplaint}
+                onAdminLoginOpen={() => setLoginOpen(true)}
+              />
+            }
+          />
           <Route path="/contact" element={<ContactPage />} />
         </Routes>
       </Layout>
@@ -352,6 +545,9 @@ function App() {
 function Layout({ theme, setTheme, isAdmin, onLogout, onAdminLoginOpen, children }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const location = useLocation()
+  const visibleNavItems = isAdmin
+    ? [...navItems, { label: 'Complaints', to: '/admin/complaints' }]
+    : navItems
 
   useEffect(() => {
     setMenuOpen(false)
@@ -373,7 +569,7 @@ function Layout({ theme, setTheme, isAdmin, onLogout, onAdminLoginOpen, children
           </NavLink>
 
           <nav className="hidden items-center gap-7 md:flex">
-            {navItems.map((item) => (
+            {visibleNavItems.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}
@@ -437,7 +633,7 @@ function Layout({ theme, setTheme, isAdmin, onLogout, onAdminLoginOpen, children
         {menuOpen && (
           <div className="border-t border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950 md:hidden">
             <div className="flex flex-col gap-2">
-              {navItems.map((item) => (
+              {visibleNavItems.map((item) => (
                 <NavLink
                   key={item.to}
                   to={item.to}
@@ -482,7 +678,7 @@ function Layout({ theme, setTheme, isAdmin, onLogout, onAdminLoginOpen, children
               Explore
             </h3>
             <ul className="space-y-3 text-sm text-slate-600 dark:text-slate-300">
-              {navItems.map((item) => (
+              {visibleNavItems.map((item) => (
                 <li key={item.to}>
                   <NavLink to={item.to} className="transition hover:text-[#102b59] dark:hover:text-[#dfeafe]">
                     {item.label}
@@ -943,7 +1139,7 @@ function NoticePage({ notices, noticesLoading, isAdmin, onAddNotice, onDeleteNot
       </div>
 
       <div className="mt-8 flex flex-wrap gap-3">
-        {['All', 'Academic', 'Administrative', 'Events'].map((option) => (
+        {noticeCategories.map((option) => (
           <button
             key={option}
             type="button"
@@ -960,16 +1156,17 @@ function NoticePage({ notices, noticesLoading, isAdmin, onAddNotice, onDeleteNot
       </div>
 
       {isAdmin && (
-        <form onSubmit={form.handleSubmit(onSubmit)} className="mt-10 rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_18px_40px_rgba(15,23,42,0.04)] dark:border-slate-800 dark:bg-slate-900">
-          <div className="mb-5 flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#edf2ff] text-[#102b59]">
-              <ImagePlus size={18} />
+        <div className="mt-10 space-y-10">
+          <form onSubmit={form.handleSubmit(onSubmit)} className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_18px_40px_rgba(15,23,42,0.04)] dark:border-slate-800 dark:bg-slate-900">
+            <div className="mb-5 flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#edf2ff] text-[#102b59]">
+                <ImagePlus size={18} />
+              </div>
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#102b59] dark:text-[#dfeafe]">Admin panel</p>
+                <h2 className="text-2xl font-bold text-slate-900 dark:text-white">Add a new notice</h2>
+              </div>
             </div>
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#102b59] dark:text-[#dfeafe]">Admin panel</p>
-              <h2 className="text-2xl font-bold text-slate-900 dark:text-white">Add a new notice</h2>
-            </div>
-          </div>
 
           <div className="grid gap-4 md:grid-cols-2">
             <div className="md:col-span-2">
@@ -984,6 +1181,7 @@ function NoticePage({ notices, noticesLoading, isAdmin, onAddNotice, onDeleteNot
                 <option value="Academic">Academic</option>
                 <option value="Administrative">Administrative</option>
                 <option value="Events">Events</option>
+                <option value="Results">Results</option>
               </select>
               {form.formState.errors.category && <p className="mt-2 text-sm text-red-600">{form.formState.errors.category.message}</p>}
             </div>
@@ -1053,6 +1251,8 @@ function NoticePage({ notices, noticesLoading, isAdmin, onAddNotice, onDeleteNot
             {isSavingNotice ? 'Publishing…' : 'Publish notice'} <ArrowRight size={16} />
           </button>
         </form>
+
+      </div>
       )}
 
       {noticeLoadError && <p role="alert" className="mt-8 rounded-2xl bg-red-50 p-4 text-sm font-medium text-red-700 dark:bg-red-950/30 dark:text-red-200">{noticeLoadError}</p>}
@@ -1227,6 +1427,365 @@ function NoticePage({ notices, noticesLoading, isAdmin, onAddNotice, onDeleteNot
           </div>
         </dialog>
       )}
+    </div>
+  )
+}
+
+function AdminComplaintsPage({ isAdmin, complaints, isLoading, error, onStatusChange, onDelete, onAdminLoginOpen }) {
+  const [filter, setFilter] = useState('all')
+  const [busyComplaintId, setBusyComplaintId] = useState('')
+  const filteredComplaints = complaints.filter((complaint) => filter === 'all' || complaint.status === filter)
+
+  if (!isAdmin) {
+    return (
+      <div className="mx-auto max-w-3xl px-4 py-20 text-center sm:px-6 lg:px-8">
+        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-[#edf2ff] text-[#102b59] dark:bg-slate-800 dark:text-[#dfeafe]">
+          <ShieldCheck size={26} />
+        </div>
+        <h1 className="mt-6 text-3xl font-black text-slate-900 dark:text-white">Admin sign-in required</h1>
+        <p className="mt-3 text-base leading-7 text-slate-600 dark:text-slate-300">Sign in with the school administrator account to access private complaints.</p>
+        <button
+          type="button"
+          onClick={onAdminLoginOpen}
+          className="mt-6 inline-flex min-h-12 items-center justify-center rounded-full bg-[#f3b239] px-6 py-3 text-sm font-bold text-[#102b59] transition hover:bg-[#efaa2d]"
+        >
+          Portal Login
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-16 sm:px-6 lg:px-8">
+      <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#102b59] dark:text-[#dfeafe]">Admin portal</p>
+          <h1 className="mt-3 text-4xl font-black text-slate-900 dark:text-white md:text-5xl">Complaints inbox</h1>
+          <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600 dark:text-slate-300">Review private submissions, view evidence images, and update each complaint’s status.</p>
+        </div>
+        <div className="rounded-2xl border border-slate-200 bg-white px-5 py-3 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+          <span className="font-bold text-slate-900 dark:text-white">{complaints.length}</span> total ·{' '}
+          <span className="font-bold text-amber-700 dark:text-amber-300">{complaints.filter((complaint) => complaint.status === 'new').length}</span> new
+        </div>
+      </div>
+
+      <div className="mt-8 flex flex-wrap gap-3" aria-label="Filter complaints">
+        {[
+          { value: 'all', label: 'All' },
+          { value: 'new', label: 'New' },
+          { value: 'resolved', label: 'Resolved' },
+        ].map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            onClick={() => setFilter(option.value)}
+            aria-pressed={filter === option.value}
+            className={`min-h-11 rounded-full px-4 py-2 text-sm font-semibold transition ${
+              filter === option.value
+                ? 'bg-[#102b59] text-white'
+                : 'border border-slate-200 bg-white text-slate-700 hover:border-slate-300 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200'
+            }`}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+
+      {error && <p role="alert" className="mt-6 rounded-2xl bg-red-50 p-4 text-sm font-medium text-red-700 dark:bg-red-950/30 dark:text-red-200">{error}</p>}
+
+      <div className="mt-8 space-y-5">
+        {isLoading ? (
+          <div className="rounded-3xl border border-slate-200 bg-white p-8 text-center text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300" role="status">
+            Loading complaints…
+          </div>
+        ) : filteredComplaints.length === 0 ? (
+          <div className="rounded-3xl border border-dashed border-slate-300 bg-white p-10 text-center text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+            {complaints.length === 0 ? 'No complaints have been submitted yet.' : 'No complaints match this filter.'}
+          </div>
+        ) : (
+          filteredComplaints.map((complaint) => (
+            <article key={complaint.id} className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-[0_18px_40px_rgba(15,23,42,0.04)] dark:border-slate-800 dark:bg-slate-900 sm:p-7">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <h2 className="text-xl font-bold text-slate-900 dark:text-white">{complaint.name}</h2>
+                    <span className={`rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide ${
+                      complaint.status === 'resolved'
+                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200'
+                        : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200'
+                    }`}>
+                      {complaint.status}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+                    {complaint.type} · {new Date(complaint.createdAt).toLocaleString()}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={busyComplaintId === complaint.id}
+                    onClick={async () => {
+                      setBusyComplaintId(complaint.id)
+                      await onStatusChange(complaint.id, complaint.status === 'resolved' ? 'new' : 'resolved')
+                      setBusyComplaintId('')
+                    }}
+                    className="min-h-11 rounded-xl border border-slate-200 px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    {busyComplaintId === complaint.id ? 'Saving…' : complaint.status === 'resolved' ? 'Reopen' : 'Mark resolved'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyComplaintId === complaint.id}
+                    onClick={async () => {
+                      if (!window.confirm('Delete this complaint and its attached images? This cannot be undone.')) return
+                      setBusyComplaintId(complaint.id)
+                      await onDelete(complaint.id)
+                      setBusyComplaintId('')
+                    }}
+                    className="min-h-11 rounded-xl border border-red-200 px-3 text-sm font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-60 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950/40"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+
+              <p className="mt-4 break-all text-sm font-medium text-[#102b59] dark:text-[#dfeafe]">
+                {complaint.contact}
+              </p>
+              <p className="mt-4 whitespace-pre-line text-sm leading-7 text-slate-700 dark:text-slate-200">{complaint.message}</p>
+
+              {complaint.images.length > 0 && (
+                <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  {complaint.images.map((image) => (
+                    <a key={image.path} href={image.url} target="_blank" rel="noreferrer" aria-label={`Open complaint attachment from ${complaint.name}`}>
+                      <img src={image.url} alt={`Complaint attachment from ${complaint.name}`} loading="lazy" className="h-28 w-full rounded-xl border border-slate-200 object-cover dark:border-slate-700" />
+                    </a>
+                  ))}
+                </div>
+              )}
+            </article>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ComplainPage({ onSubmitComplaint }) {
+  const [submitted, setSubmitted] = useState(false)
+  const [formError, setFormError] = useState('')
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [formData, setFormData] = useState({
+    name: '',
+    contact: '',
+    type: '',
+    message: '',
+  })
+  const [attachments, setAttachments] = useState([])
+  const attachmentUrlsRef = useRef(new Set())
+
+  useEffect(() => () => {
+    attachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
+  }, [])
+
+  const updateField = (field, value) => {
+    setSubmitted(false)
+    setFormError('')
+    setFormData((current) => ({ ...current, [field]: value }))
+  }
+
+  const handleAttachments = (event) => {
+    const files = Array.from(event.target.files || [])
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
+    const error = files.some((file) => !allowedTypes.includes(file.type))
+      ? 'Choose JPG, PNG, or WebP images only.'
+      : files.some((file) => file.size > 1024 * 1024)
+        ? 'Each image must be no larger than 1 MB.'
+        : attachments.length + files.length > 4
+          ? 'You can attach up to 4 images.'
+          : ''
+
+    event.target.value = ''
+    if (error) {
+      setFormError(error)
+      return
+    }
+
+    setSubmitted(false)
+    setFormError('')
+    setAttachments((current) => [
+      ...current,
+      ...files.map((file) => {
+        const url = URL.createObjectURL(file)
+        attachmentUrlsRef.current.add(url)
+        return { file, url }
+      }),
+    ])
+  }
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    setIsSubmitting(true)
+    setFormError('')
+    setSubmitted(false)
+
+    try {
+      const result = await onSubmitComplaint({
+        ...formData,
+        attachments: attachments.map(({ file }) => file),
+      })
+      if (result?.error) {
+        setFormError(result.error)
+        return
+      }
+
+      setSubmitted(true)
+      setFormData({ name: '', contact: '', type: '', message: '' })
+      attachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
+      attachmentUrlsRef.current.clear()
+      setAttachments([])
+    } catch (error) {
+      setFormError(`Your complaint could not be submitted: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-16 sm:px-6 lg:px-8">
+      <div className="grid gap-8 lg:grid-cols-[1fr_1.2fr] lg:items-start">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#102b59] dark:text-[#dfeafe]">Complain</p>
+          <h1 className="mt-3 text-4xl font-black text-slate-900 dark:text-white md:text-5xl">Share your concern with the school</h1>
+          <p className="mt-5 max-w-lg text-lg leading-8 text-slate-600 dark:text-slate-300">
+            Share a concern or complaint with the school office. Submissions are private and visible only to an authorized school administrator.
+          </p>
+
+          <div className="mt-8 rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_18px_40px_rgba(15,23,42,0.04)] dark:border-slate-800 dark:bg-slate-900">
+            <p className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">Reach the office</p>
+            <ul className="mt-5 space-y-4 text-sm text-slate-700 dark:text-slate-200">
+              <li className="flex gap-3"><MapPin size={18} className="mt-0.5 text-[#102b59] dark:text-[#dfeafe]" /> {schoolInfo.location}</li>
+              <li className="flex gap-3"><Phone size={18} className="mt-0.5 text-[#102b59] dark:text-[#dfeafe]" /> {schoolInfo.phone}</li>
+              <li className="flex gap-3"><Mail size={18} className="mt-0.5 text-[#102b59] dark:text-[#dfeafe]" /> {schoolInfo.email}</li>
+            </ul>
+          </div>
+        </div>
+
+        <form onSubmit={handleSubmit} className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-[0_18px_40px_rgba(15,23,42,0.04)] dark:border-slate-800 dark:bg-slate-900 sm:p-8">
+          <div className="grid gap-5 md:grid-cols-2">
+            <div>
+              <label htmlFor="complaint-name" className="mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-200">Full name</label>
+              <input
+                id="complaint-name"
+                required
+                minLength={2}
+                maxLength={120}
+                value={formData.name}
+                onChange={(event) => updateField('name', event.target.value)}
+                className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-800 outline-none focus:border-[#102b59] dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                placeholder="Your name"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="complaint-contact" className="mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-200">Phone or email</label>
+              <input
+                id="complaint-contact"
+                required
+                minLength={3}
+                maxLength={200}
+                value={formData.contact}
+                onChange={(event) => updateField('contact', event.target.value)}
+                className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-800 outline-none focus:border-[#102b59] dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                placeholder="Contact details"
+              />
+            </div>
+
+            <div className="md:col-span-2">
+              <label htmlFor="complaint-category" className="mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-200">Complaint type</label>
+              <select
+                id="complaint-category"
+                required
+                value={formData.type}
+                onChange={(event) => updateField('type', event.target.value)}
+                className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-800 outline-none focus:border-[#102b59] dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+              >
+                <option value="">Select a category</option>
+                <option value="Academic">Academic</option>
+                <option value="Facilities">Facilities</option>
+                <option value="Behavior">Behavior</option>
+                <option value="Administration">Administration</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+
+            <div className="md:col-span-2">
+              <label htmlFor="complaint-message" className="mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-200">Your message</label>
+              <textarea
+                id="complaint-message"
+                required
+                minLength={10}
+                maxLength={5000}
+                rows="6"
+                value={formData.message}
+                onChange={(event) => updateField('message', event.target.value)}
+                className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-800 outline-none focus:border-[#102b59] dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                placeholder="Please describe the issue clearly so the school can help you."
+              />
+            </div>
+
+            <div className="md:col-span-2">
+              <label htmlFor="complaint-images" className="mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-200">Attach images (optional)</label>
+              <input
+                id="complaint-images"
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                multiple
+                onChange={handleAttachments}
+                aria-describedby="complaint-image-help"
+                className="w-full cursor-pointer rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 file:mr-3 file:rounded-full file:border-0 file:bg-[#edf2ff] file:px-4 file:py-2 file:font-semibold file:text-[#102b59] hover:file:bg-[#dfe8ff] dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:file:bg-slate-800 dark:file:text-slate-100"
+              />
+              <p id="complaint-image-help" className="mt-2 text-xs text-slate-500 dark:text-slate-400">Up to 4 JPG, PNG, or WebP images, 1 MB each.</p>
+              {attachments.length > 0 && (
+                <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  {attachments.map((attachment) => (
+                    <div key={attachment.url} className="relative overflow-hidden rounded-2xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-950">
+                      <img src={attachment.url} alt={`Preview of ${attachment.file.name}`} className="h-24 w-full object-cover" />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          URL.revokeObjectURL(attachment.url)
+                          attachmentUrlsRef.current.delete(attachment.url)
+                          setAttachments((current) => current.filter((item) => item.url !== attachment.url))
+                        }}
+                        aria-label={`Remove ${attachment.file.name}`}
+                        className="absolute right-1 top-1 inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-red-700 shadow focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-600"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-sm text-slate-500 dark:text-slate-400">Your message and any attached images are sent securely to the school.</p>
+            <button type="submit" disabled={isSubmitting} className="inline-flex min-h-12 items-center justify-center rounded-full bg-[#f3b239] px-6 py-3 text-sm font-bold text-[#102b59] transition hover:bg-[#efaa2d] disabled:cursor-wait disabled:opacity-60">
+              {isSubmitting ? 'Submitting…' : 'Submit complaint'}
+            </button>
+          </div>
+
+          {formError && <p role="alert" className="mt-5 rounded-2xl bg-red-50 p-4 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-200">{formError}</p>}
+          {submitted && (
+            <div role="status" className="mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+              Your complaint was submitted successfully. The school office will review it.
+            </div>
+          )}
+        </form>
+      </div>
     </div>
   )
 }
