@@ -37,3 +37,7 @@ npm run dev
 ```
 
 Without Supabase environment variables, the app only shows its sample notices; admin login and notice publishing are unavailable. This mode is for local preview and is not shared between visitors.
+
+## Cloudflare Pages deployment
+
+Create a Cloudflare Pages project connected to this GitHub repository. Use `npm run build` as the build command and `dist` as the output directory. Configure `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` as Pages build environment variables for production and preview builds; these are public client settings, never use a Supabase service-role key. The `public/_redirects` and `public/_headers` files are copied into `dist` by Vite to preserve SPA routing and the site's security headers on Cloudflare Pages.
