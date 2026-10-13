@@ -43,8 +43,8 @@ const noticeCategories = ['All', 'Academic', 'Administrative', 'Events', 'Result
 const schoolInfo = {
   name: 'Darbar Secondary School',
   location: 'Aarughat-8, Gorkha, Nepal',
-  principal: 'Mr. Krishna Bahadur Shrestha',
-  coPrincipal: 'Mrs. Sunita Poudel',
+  principal: 'Govinda Prasad Bhatta',
+  coPrincipal: 'Bed bahadur Surkheti ',
   email: 'info@darbarsecondary.edu.np',
   phone: '+977-9861234567',
 }
