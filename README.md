@@ -6,7 +6,7 @@ The public website can display notices without logging in. Notice publishing, de
 
 1. Create a Supabase project.
 2. In **Project Settings → API**, copy the project URL and the **publishable** key (or legacy anon key). Put them in a root `.env.local` file using the names in `.env.example`. These are public client values; never put a service-role/secret key in a `VITE_` variable.
-3. Open the Supabase **SQL Editor** and run `supabase/migrations/20261001000000_secure_notice_portal.sql`, then run `supabase/migrations/20261013000000_complaints_inbox.sql`, followed by `supabase/migrations/20261014000000_limit_complaint_submissions.sql`.
+3. Open the Supabase **SQL Editor** and run `supabase/migrations/20261001000000_secure_notice_portal.sql`, then run `supabase/migrations/20261013000000_complaints_inbox.sql`, followed by `supabase/migrations/20261014000000_limit_complaint_submissions.sql` and `supabase/migrations/20261015000000_fix_complaint_image_upload_policy.sql`.
 4. In **Authentication → Providers → Email**, disable public sign-ups. Create the single administrator account yourself from the Supabase dashboard; do not add a public registration page.
 5. In **Authentication → Users**, copy that account's user UUID. In the SQL Editor, allow-list only that account:
 
@@ -25,7 +25,7 @@ The complaints migration adds a separate `/admin/complaints` inbox. Anyone can s
 
 The complaint rate-limit migration permits up to three submissions using the same normalized contact value per hour. This limits repeated submissions but is not IP-based bot protection; a production CAPTCHA or WAF requires a server-verified challenge or hosting-level configuration.
 
-Run all three migrations in the production Supabase project before deploying the updated frontend. The complaint form reports configuration or submission errors rather than showing a false success when Supabase is unavailable.
+Run all four migrations in the production Supabase project before deploying the updated frontend. The complaint form reports configuration or submission errors rather than showing a false success when Supabase is unavailable.
 
 For bot resistance, keep Supabase Auth's rate limits enabled and keep public account sign-ups disabled. Cloudflare bot/rate-limit protections add a layer for the hosted website, but do not replace Supabase Auth controls or database row-level security. Supabase CAPTCHA/Turnstile token handling is not wired into this frontend; do not enable Supabase CAPTCHA until the login form is updated to provide its token. No static site setup can guarantee protection from every denial-of-service attack.
 
